@@ -5,17 +5,19 @@ Each Pydantic model corresponds to a MongoDB collection with the lowercase
 class name used as the collection name.
 """
 from typing import Optional, List, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from datetime import datetime, date
 
 # Core domain schemas
 
 class User(BaseModel):
     name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
+    email: EmailStr = Field(..., description="Email address")
     address: Optional[str] = Field(None, description="Delivery address")
     phone: Optional[str] = Field(None, description="Phone number")
     is_active: bool = Field(True, description="Active user")
+    role: Literal['client','admin'] = Field('client', description="User role")
+    password_hash: Optional[str] = Field(None, description="BCrypt password hash")
 
 class Product(BaseModel):
     name: str = Field(..., description="Product name")

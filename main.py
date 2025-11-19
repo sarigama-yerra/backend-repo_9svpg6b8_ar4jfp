@@ -1,10 +1,13 @@
 import os
-from datetime import datetime, timedelta, time, date, timezone
+from datetime import datetime, timedelta, time, date
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field, EmailStr
+import jwt
+from passlib.context import CryptContext
 
 from database import db, create_document, get_documents
 from bson import ObjectId
@@ -21,9 +24,48 @@ app.add_middleware(
 
 # ----- Config -----
 CUTOFF_HOUR = int(os.getenv("CUTOFF_HOUR", 23))  # 11 PM default
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60*24))
+
+# ----- Auth Setup -----
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# ----- Models -----
+def _oid(id_str: str) -> ObjectId:
+    try:
+        return ObjectId(id_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid id format")
+
+
+# ----- Auth Models -----
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class TokenData(BaseModel):
+    user_id: Optional[str] = None
+    role: Optional[str] = None
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: Optional[str] = "client"
+
+
+class UserPublic(BaseModel):
+    id: str
+    name: str
+    email: EmailStr
+    role: str
+
+
+# ----- Domain Models for existing endpoints -----
 class TopUpRequest(BaseModel):
     user_id: str
     amount: float = Field(..., gt=0)
@@ -56,14 +98,56 @@ class ProductUpdate(BaseModel):
     available: Optional[bool] = None
 
 
-# ----- Helpers -----
+# ----- Auth Helpers -----
 
-def _oid(id_str: str) -> ObjectId:
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+
+def get_user_by_email(email: str):
+    return db["user"].find_one({"email": email})
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        return ObjectId(id_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid id format")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        if user_id is None:
+            raise credentials_exception
+    except jwt.InvalidTokenError:
+        raise credentials_exception
+    user = db["user"].find_one({"_id": _oid(user_id)})
+    if user is None:
+        raise credentials_exception
+    user["id"] = str(user.pop("_id"))
+    return user
 
+
+async def require_admin(user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+    return user
+
+
+# ----- Utility -----
 
 def compute_wallet_balance(user_id: str) -> float:
     txns = get_documents("transaction", {"user_id": user_id})
@@ -85,7 +169,7 @@ def get_delivery_date(now: datetime) -> date:
         return (now + timedelta(days=2)).date()
 
 
-# ----- Routes -----
+# ----- Public Routes -----
 @app.get("/")
 def read_root():
     return {"message": "Micro Delivery Backend Running"}
@@ -102,6 +186,37 @@ def get_config():
     }
 
 
+# Auth routes
+@app.post("/api/auth/register", response_model=UserPublic)
+def register_user(payload: UserCreate):
+    existing = get_user_by_email(payload.email)
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = {
+        "name": payload.name,
+        "email": payload.email,
+        "password_hash": get_password_hash(payload.password),
+        "role": payload.role or "client",
+        "is_active": True,
+    }
+    uid = create_document("user", doc)
+    return {"id": uid, "name": payload.name, "email": payload.email, "role": doc["role"]}
+
+
+@app.post("/api/auth/token", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = get_user_by_email(form_data.username)
+    if not user or not verify_password(form_data.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": str(user["_id"]), "role": user.get("role", "client")})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/api/auth/me", response_model=UserPublic)
+async def read_users_me(current_user=Depends(get_current_user)):
+    return {"id": current_user["id"], "name": current_user["name"], "email": current_user["email"], "role": current_user.get("role", "client")}
+
+
 # Wallet
 @app.get("/api/wallet/balance")
 def wallet_balance(user_id: str = Query(...)):
@@ -109,7 +224,9 @@ def wallet_balance(user_id: str = Query(...)):
 
 
 @app.post("/api/wallet/topup")
-def wallet_topup(req: TopUpRequest):
+def wallet_topup(req: TopUpRequest, current_user=Depends(get_current_user)):
+    if current_user["id"] != req.user_id and current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not allowed to top up this wallet")
     txn = {
         "user_id": req.user_id,
         "type": "credit",
@@ -130,13 +247,13 @@ def list_products():
 
 
 @app.post("/api/products")
-def create_product(p: ProductIn):
+def create_product(p: ProductIn, admin=Depends(require_admin)):
     pid = create_document("product", p.model_dump())
     return {"id": pid}
 
 
 @app.put("/api/products/{product_id}")
-def update_product(product_id: str, upd: ProductUpdate):
+def update_product(product_id: str, upd: ProductUpdate, admin=Depends(require_admin)):
     data = {k: v for k, v in upd.model_dump().items() if v is not None}
     if not data:
         return {"updated": False}
@@ -147,7 +264,7 @@ def update_product(product_id: str, upd: ProductUpdate):
 
 
 @app.delete("/api/products/{product_id}")
-def delete_product(product_id: str):
+def delete_product(product_id: str, admin=Depends(require_admin)):
     res = db["product"].delete_one({"_id": _oid(product_id)})
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Product not found")
@@ -156,7 +273,9 @@ def delete_product(product_id: str):
 
 # Orders
 @app.post("/api/orders/place")
-def place_order(req: PlaceOrderRequest):
+def place_order(req: PlaceOrderRequest, current_user=Depends(get_current_user)):
+    if current_user["id"] != req.user_id and current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not allowed to place order for this user")
     if not req.items:
         raise HTTPException(status_code=400, detail="No items in order")
 
@@ -232,7 +351,7 @@ def place_order(req: PlaceOrderRequest):
 
 
 @app.get("/api/orders/summary-next-morning")
-def summary_next_morning():
+def summary_next_morning(current_user=Depends(require_admin)):
     # Consolidate items for orders scheduled for "tomorrow" (from server time)
     tomorrow = (datetime.now().date() + timedelta(days=1)).isoformat()
     orders = get_documents("order", {"delivery_date": tomorrow, "status": {"$in": ["placed", "packed"]}})
